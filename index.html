@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Poly</title>
+<style>
+:root{color-scheme:dark}
+body{margin:0;height:100dvh;display:grid;grid-template-rows:auto 1fr;font:14px system-ui,sans-serif;background:#111;color:#eee}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 1rem;padding:.6rem 1rem;background:#1c1c1c}
+fieldset{display:contents}
+label{display:flex;align-items:center;gap:.4rem}
+input[type=range]{accent-color:#6cf}
+main{position:relative}
+canvas{position:absolute;inset:1rem;width:calc(100% - 2rem);height:calc(100% - 2rem);object-fit:contain}
+</style>
+<header>
+  <input type="file" id="file" accept="image/*" aria-label="Image">
+  <fieldset id="controls" disabled>
+    <label>Detail <input type="range" id="detail" min="0" max="1" step="any" value=".6"></label>
+    <label>Edge focus <input type="range" id="focus" min="0" max="1" step="any" value=".85"></label>
+    <button id="shuffle">Shuffle</button>
+    <button id="png">Save PNG</button>
+    <button id="svg">Save SVG</button>
+  </fieldset>
+  <span id="msg" role="status">Pick, drop or paste an image</span>
+</header>
+<main><canvas id="view" hidden></canvas></main>
+<script>
+// Pipeline: GPU edge map -> CPU point sampling + Delaunay -> GPU triangle colours -> GPU render (4x MSAA).
+// Without WebGPU the three GPU steps run on the CPU + Canvas 2D instead (sobel, meanColors, the 2D branch of draw).
+// Note: sampling and triangulation run on the main thread; move to a worker if the sliders ever feel slow.
+const WGSL = `
+@group(0) @binding(0) var img: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@group(0) @binding(2) var<storage, read_write> edge: array<f32>;
+@group(0) @binding(3) var<storage, read> pos: array<vec2f>;
+@group(0) @binding(4) var<storage, read> idx: array<u32>;
+@group(0) @binding(5) var<storage, read_write> colOut: array<vec4f>;
+@group(0) @binding(6) var<storage, read> col: array<vec4f>;
+
+// Sobel over rgb, taps 1.5px apart for a little smoothing
+@compute @workgroup_size(8, 8) fn edges(@builtin(global_invocation_id) id: vec3u) {
+  let size = textureDimensions(img);
+  if (id.x >= size.x || id.y >= size.y) { return; }
+  let uv = (vec2f(id.xy) + .5) / vec2f(size);
+  let d = 1.5 / vec2f(size);
+  var gx = vec3f(0);
+  var gy = vec3f(0);
+  for (var j = -1; j <= 1; j++) { for (var i = -1; i <= 1; i++) {
+    let c = textureSampleLevel(img, smp, uv + vec2f(f32(i), f32(j)) * d, 0).rgb;
+    gx += c * f32(i * (2 - abs(j)));
+    gy += c * f32(j * (2 - abs(i)));
+  }}
+  edge[id.y * size.x + id.x] = sqrt(dot(gx, gx) + dot(gy, gy));
+}
+
+// mean colour of each triangle, averaged in linear light over 36 interior samples
+@compute @workgroup_size(64) fn colors(@builtin(global_invocation_id) id: vec3u) {
+  let t = id.x;
+  if (t >= arrayLength(&colOut)) { return; }
+  let a = pos[idx[3 * t]];
+  let b = pos[idx[3 * t + 1]];
+  let c = pos[idx[3 * t + 2]];
+  var sum = vec3f(0);
+  for (var i = 0; i < 8; i++) { for (var j = 0; j < 8 - i; j++) {
+    let p = a + ((b - a) * (f32(i) + 1. / 3.) + (c - a) * (f32(j) + 1. / 3.)) / 8.;
+    sum += pow(textureSampleLevel(img, smp, p, 0).rgb, vec3f(2.2));
+  }}
+  colOut[t] = vec4f(pow(sum / 36., vec3f(1. / 2.2)), 1);
+}
+
+struct V { @builtin(position) p: vec4f, @location(0) @interpolate(flat) c: vec4f }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+  let p = pos[idx[i]];
+  return V(vec4f(p.x * 2 - 1, 1 - p.y * 2, 0, 1), col[i / 3]);
+}
+@fragment fn fs(v: V) -> @location(0) vec4f { return v.c; }`;
+
+const WORK = 1024; // long side of the analysis image; output is vector so it renders sharper than this
+const $ = id => document.getElementById(id), say = t => { $('msg').textContent = t; };
+let device, ctx, fmt, sampler, edgePipe, colorPipe, drawPipe, msaa;
+let img, mesh, seed = 1; // img: {W, H, e2, mean, tex | px}  mesh: {pts, tris, posBuf, idxBuf, colBuf, group | col}
+
+const corners = (pts, tris, t) => [0, 1, 2].flatMap(k => [pts[2 * tris[3 * t + k]], pts[2 * tris[3 * t + k] + 1]]);
+const hex = (col, t) => '#' + [0, 1, 2].map(k => Math.round(Math.min(1, col[4 * t + k]) * 255).toString(16).padStart(2, '0')).join('');
+
+const bind = (pipe, res) => device.createBindGroup({
+  layout: pipe.getBindGroupLayout(0),
+  entries: Object.entries(res).map(([binding, resource]) => ({binding: +binding, resource})),
+});
+const upload = data => {
+  const b = device.createBuffer({size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(b, 0, data);
+  return b;
+};
+async function read(src, size) { // GPU buffer -> Float32Array
+  const dst = device.createBuffer({size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(src, 0, dst, 0, size);
+  device.queue.submit([enc.finish()]);
+  await dst.mapAsync(GPUMapMode.READ);
+  const out = new Float32Array(dst.getMappedRange().slice(0));
+  dst.destroy();
+  return out;
+}
+
+async function init() {
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) { ctx = $('view').getContext('2d'); return; }
+  device = await adapter.requestDevice();
+  fmt = navigator.gpu.getPreferredCanvasFormat();
+  ctx = $('view').getContext('webgpu');
+  ctx.configure({device, format: fmt});
+  sampler = device.createSampler({magFilter: 'linear', minFilter: 'linear'});
+  const module = device.createShaderModule({code: WGSL});
+  edgePipe = device.createComputePipeline({layout: 'auto', compute: {module, entryPoint: 'edges'}});
+  colorPipe = device.createComputePipeline({layout: 'auto', compute: {module, entryPoint: 'colors'}});
+  drawPipe = device.createRenderPipeline({
+    layout: 'auto', multisample: {count: 4},
+    vertex: {module, entryPoint: 'vs'},
+    fragment: {module, entryPoint: 'fs', targets: [{format: fmt}]},
+  });
+}
+
+// CPU twins of the two compute shaders, used only without WebGPU
+function sobel(px, W, H) {
+  const out = new Float32Array(W * H), at = (v, n) => Math.min(Math.max(v, 0), n - 1);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let s = 0;
+    for (let ch = 0; ch < 3; ch++) {
+      let gx = 0, gy = 0;
+      for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+        const v = px[4 * (at(y + j, H) * W + at(x + i, W)) + ch] / 255;
+        gx += v * i * (2 - Math.abs(j));
+        gy += v * j * (2 - Math.abs(i));
+      }
+      s += gx * gx + gy * gy;
+    }
+    out[y * W + x] = Math.sqrt(s);
+  }
+  return out;
+}
+const LIN = Float32Array.from({length: 256}, (_, i) => (i / 255) ** 2.2);
+function meanColors(pts, tris, {W, H, px}) {
+  const col = new Float32Array(tris.length / 3 * 4);
+  for (let t = 0; t < tris.length / 3; t++) {
+    const [ax, ay, bx, by, cx, cy] = corners(pts, tris, t), sum = [0, 0, 0];
+    for (let i = 0; i < 8; i++) for (let j = 0; j < 8 - i; j++) {
+      const u = (i + 1 / 3) / 8, v = (j + 1 / 3) / 8;
+      const x = Math.min(W - 1, ax + (bx - ax) * u + (cx - ax) * v | 0), y = Math.min(H - 1, ay + (by - ay) * u + (cy - ay) * v | 0);
+      for (let k = 0; k < 3; k++) sum[k] += LIN[px[4 * (y * W + x) + k]];
+    }
+    col.set(sum.map(s => (s / 36) ** (1 / 2.2)), 4 * t);
+  }
+  return col;
+}
+
+async function load(file) {
+  if (!ctx || !file) return;
+  let full;
+  try { full = await createImageBitmap(file); } catch { return say('Could not read that as an image.'); }
+  const long = Math.max(full.width, full.height), k = Math.min(1, WORK / long);
+  const W = Math.round(full.width * k), H = Math.round(full.height * k);
+  const small = await createImageBitmap(full, {resizeWidth: W, resizeHeight: H, resizeQuality: 'high'});
+  let tex, px, e2;
+  if (device) {
+    img?.tex.destroy();
+    tex = device.createTexture({
+      size: [W, H], format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    device.queue.copyExternalImageToTexture({source: small}, {texture: tex}, [W, H]);
+    const edgeBuf = device.createBuffer({size: W * H * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC});
+    const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+    pass.setPipeline(edgePipe);
+    pass.setBindGroup(0, bind(edgePipe, {0: tex.createView(), 1: sampler, 2: {buffer: edgeBuf}}));
+    pass.dispatchWorkgroups(Math.ceil(W / 8), Math.ceil(H / 8));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    e2 = await read(edgeBuf, W * H * 4);
+    edgeBuf.destroy();
+  } else {
+    const g = new OffscreenCanvas(W, H).getContext('2d');
+    g.drawImage(small, 0, 0);
+    px = g.getImageData(0, 0, W, H).data;
+    e2 = sobel(px, W, H);
+  }
+  // normalise by the 98th percentile so a few extreme edges don't flatten the rest, then square to mute texture noise
+  const p98 = e2.filter((_, i) => i % 97 == 0).sort()[W * H / 97 * .98 | 0] || 1;
+  let mean = 0;
+  for (let i = 0; i < e2.length; i++) mean += e2[i] = Math.min(1, e2[i] / p98) ** 2;
+  mean = mean / e2.length || 1e-6;
+
+  // output resolution: the source's, but at least 2048 (it's vector, upscaling is free) and at most 4096 (MSAA memory)
+  const scale = Math.min(4096, Math.max(2048, long)) / long, c = $('view');
+  c.width = Math.round(full.width * scale);
+  c.height = Math.round(full.height * scale);
+  msaa?.destroy();
+  msaa = device?.createTexture({size: [c.width, c.height], sampleCount: 4, format: fmt, usage: GPUTextureUsage.RENDER_ATTACHMENT});
+  img = {W, H, tex, px, e2, mean};
+  c.hidden = false;
+  $('controls').disabled = false;
+  remesh();
+}
+
+// mulberry32: seeded so the same settings give the same picture
+const rng = s => () => {
+  s = s + 0x6D2B79F5 | 0;
+  let t = Math.imul(s ^ s >>> 15, 1 | s);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+};
+
+// Variable-radius Poisson-disc sampling: candidates are drawn in proportion to a density that follows edges,
+// and each keeps a clearance of 1/sqrt(density), so edges get many small triangles and flat areas few large ones.
+function samplePoints({W, H, e2, mean}, n, focus, rand) {
+  const base = (1.03 - focus) * mean, cdf = new Float64Array(W * H);
+  let sum = 0;
+  for (let i = 0; i < cdf.length; i++) cdf[i] = sum += base + focus * e2[i];
+  const R = .75 * Math.sqrt(W * H / n), wMean = sum / cdf.length; // .75: just under the packing limit for n points
+  const gw = (W / R | 0) + 1, gh = (H / R | 0) + 1, head = new Int32Array(gw * gh).fill(-1), next = [];
+  const pts = [];
+  const add = (x, y) => {
+    const c = (y / R | 0) * gw + (x / R | 0);
+    next.push(head[c]);
+    head[c] = pts.length / 2;
+    pts.push(x, y);
+  };
+  const clear = (x, y, r) => {
+    const x1 = Math.min(gw - 1, (x + r) / R | 0), y1 = Math.min(gh - 1, (y + r) / R | 0);
+    for (let cy = Math.max(0, (y - r) / R | 0); cy <= y1; cy++)
+      for (let cx = Math.max(0, (x - r) / R | 0); cx <= x1; cx++)
+        for (let i = head[cy * gw + cx]; i >= 0; i = next[i])
+          if ((pts[2 * i] - x) ** 2 + (pts[2 * i + 1] - y) ** 2 < r * r) return false;
+    return true;
+  };
+  add(0, 0); add(W, 0); add(0, H); add(W, H);
+  for (let tries = n * 12; tries-- && pts.length < 2 * n;) {
+    const u = rand() * sum;
+    let lo = 0, hi = cdf.length - 1;
+    while (lo < hi) { const m = lo + hi >> 1; if (cdf[m] < u) lo = m + 1; else hi = m; }
+    // climb to the nearest edge ridge so triangle sides run along image edges instead of straddling them
+    for (let step = 0; step < 4; step++) {
+      let best = lo;
+      for (const d of [-W - 1, -W, -W + 1, -1, 1, W - 1, W, W + 1]) if (e2[lo + d] > e2[best]) best = lo + d;
+      if (best == lo) break;
+      lo = best;
+    }
+    let x = lo % W + rand(), y = (lo / W | 0) + rand();
+    const r = R * Math.sqrt(wMean / (base + focus * e2[lo]));
+    // points near the border snap onto it: covers the whole image without sliver triangles along the rim
+    if (x < r / 2) x = 0; else if (x > W - r / 2) x = W;
+    if (y < r / 2) y = 0; else if (y > H - r / 2) y = H;
+    if (clear(x, y, r)) add(x, y);
+  }
+  return pts;
+}
+
+// Bowyer–Watson with an x-sweep: a triangle whose circumcircle lies wholly behind the sweep line is final.
+// p: flat [x, y, …] without duplicates; returns flat vertex-index triples.
+function delaunay(p) {
+  const n = p.length / 2, B = 1e6; // super-triangle must dwarf the image
+  const q = p.concat(-B, -B, B, -B, 0, B);
+  const circ = (a, b, c) => { // circumcircle, relative to a for precision
+    const ax = q[2 * a], ay = q[2 * a + 1];
+    const bx = q[2 * b] - ax, by = q[2 * b + 1] - ay, cx = q[2 * c] - ax, cy = q[2 * c + 1] - ay;
+    const d = 2 * (bx * cy - by * cx), b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+    const ux = (cy * b2 - by * c2) / d, uy = (bx * c2 - cx * b2) / d;
+    return {a, b, c, x: ax + ux, y: ay + uy, r2: ux * ux + uy * uy};
+  };
+  const order = Array.from({length: n}, (_, i) => i).sort((i, j) => q[2 * i] - q[2 * j]);
+  let open = [circ(n, n + 1, n + 2)];
+  const done = [], M = n + 3;
+  for (const i of order) {
+    const x = q[2 * i], y = q[2 * i + 1], edges = [];
+    open = open.filter(t => {
+      const dx = x - t.x, dy = y - t.y;
+      if (dx > 0 && dx * dx > t.r2) { done.push(t); return false; } // sweep has passed it
+      if (dx * dx + dy * dy > t.r2) return true;                     // point outside: keep
+      edges.push(t.a, t.b, t.b, t.c, t.c, t.a);                      // point inside: remove, remember its edges
+      return false;
+    });
+    // an edge shared by two removed triangles is inside the hole; only the hole's rim gets new triangles
+    const rim = new Map();
+    for (let k = 0; k < edges.length; k += 2) {
+      const a = edges[k], b = edges[k + 1], key = a < b ? a * M + b : b * M + a;
+      rim.set(key, rim.has(key) ? -1 : k);
+    }
+    for (const k of rim.values()) if (k >= 0) open.push(circ(i, edges[k], edges[k + 1]));
+  }
+  return done.concat(open).filter(t => t.a < n && t.b < n && t.c < n).flatMap(t => [t.a, t.b, t.c]);
+}
+
+function remesh() {
+  const {W, H, tex} = img;
+  const pts = samplePoints(img, Math.round(100 * 200 ** $('detail').value), +$('focus').value, rng(seed));
+  const tris = delaunay(pts), T = tris.length / 3;
+  // self-check: the triangles must tile the image exactly
+  let area = 0;
+  for (let t = 0; t < T; t++) {
+    const [ax, ay, bx, by, cx, cy] = corners(pts, tris, t);
+    area += Math.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)) / 2;
+  }
+  console.assert(Math.abs(area - W * H) < 1, 'triangulation does not tile the image', area, W * H);
+
+  if (device) {
+    for (const b of [mesh?.posBuf, mesh?.idxBuf, mesh?.colBuf]) b?.destroy();
+    const posBuf = upload(Float32Array.from(pts, (v, i) => v / (i & 1 ? H : W)));
+    const idxBuf = upload(new Uint32Array(tris));
+    const colBuf = device.createBuffer({size: T * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC});
+    const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+    pass.setPipeline(colorPipe);
+    pass.setBindGroup(0, bind(colorPipe, {0: tex.createView(), 1: sampler, 3: {buffer: posBuf}, 4: {buffer: idxBuf}, 5: {buffer: colBuf}}));
+    pass.dispatchWorkgroups(Math.ceil(T / 64));
+    pass.end();
+    device.queue.submit([enc.finish()]);
+    mesh = {pts, tris, posBuf, idxBuf, colBuf, group: bind(drawPipe, {3: {buffer: posBuf}, 4: {buffer: idxBuf}, 6: {buffer: colBuf}})};
+  } else mesh = {pts, tris, col: meanColors(pts, tris, img)};
+  draw();
+  say(T + ' triangles');
+}
+
+function draw() {
+  if (!device) {
+    const c = $('view'), {pts, tris, col} = mesh;
+    ctx.setTransform(c.width / img.W, 0, 0, c.height / img.H, 0, 0);
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = img.W / c.width; // one output pixel, in the fill colour, hides antialiasing seams
+    for (let t = 0; t < tris.length / 3; t++) {
+      const [ax, ay, bx, by, cx, cy] = corners(pts, tris, t);
+      ctx.beginPath();
+      ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.lineTo(cx, cy);
+      ctx.closePath();
+      ctx.fillStyle = ctx.strokeStyle = hex(col, t);
+      ctx.fill(); ctx.stroke();
+    }
+    return;
+  }
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginRenderPass({colorAttachments: [{
+    view: msaa.createView(), resolveTarget: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'discard',
+  }]});
+  pass.setPipeline(drawPipe);
+  pass.setBindGroup(0, mesh.group);
+  pass.draw(mesh.tris.length);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+}
+
+const save = (blob, name) => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1e4);
+};
+function savePng() {
+  draw(); // a WebGPU canvas only holds its pixels until the frame is presented, so redraw right before reading
+  $('view').toBlob(b => save(b, 'poly.png'));
+}
+async function saveSvg() {
+  const {pts, tris, colBuf} = mesh, col = mesh.col || await read(colBuf, colBuf.size);
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${img.W} ${img.H}" stroke-width=".5" stroke-linejoin="round">`;
+  for (let t = 0; t < tris.length / 3; t++) {
+    const c = hex(col, t), [ax, ay, bx, by, cx, cy] = corners(pts, tris, t).map(v => +v.toFixed(1));
+    s += `<path fill="${c}" stroke="${c}" d="M${ax},${ay}L${bx},${by}L${cx},${cy}Z"/>`; // stroke in the fill colour hides antialiasing seams
+  }
+  save(new Blob([s + '</svg>'], {type: 'image/svg+xml'}), 'poly.svg');
+}
+
+$('file').onchange = e => load(e.target.files[0]);
+$('detail').oninput = $('focus').oninput = remesh;
+$('shuffle').onclick = () => { seed++; remesh(); };
+$('png').onclick = savePng;
+$('svg').onclick = saveSvg;
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); load(e.dataTransfer.files[0]); });
+addEventListener('paste', e => load(e.clipboardData.files[0]));
+init();
+</script>
